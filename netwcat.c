@@ -18,9 +18,9 @@ void print_usage_and_exit(int status) {
   FILE *stream = (status == EXIT_SUCCESS) ? stdout : stderr;
   fprintf(stream, "Usage:\n");
   fprintf(stream, "  Server mode: netwcat -l PORT [-o FILE] [-w WRITELIMIT] "
-                  "[-r READLIMIT]\n");
+                  "[-r READLIMIT] [-v]\n");
   fprintf(stream, "  Client mode: netwcat -c HOST:PORT [-i FILE] [-w "
-                  "WRITELIMIT] [-r READLIMIT]\n");
+                  "WRITELIMIT] [-r READLIMIT] [-v]\n");
   fprintf(stream, "  Options:\n");
   fprintf(stream, "    -l PORT       Listen on local TCP port\n");
   fprintf(stream, "    -c HOST:PORT  Connect to remote HOST and PORT\n");
@@ -28,6 +28,7 @@ void print_usage_and_exit(int status) {
   fprintf(stream, "    -o FILE       Write to OUTPUTFILE (default: stdout)\n");
   fprintf(stream, "    -r BYTES      Stop reading after READLIMIT bytes\n");
   fprintf(stream, "    -w BYTES      Stop writing after WRITELIMIT bytes\n");
+  fprintf(stream, "    -v            Verbose mode (show status messages)\n");
   fprintf(stream, "    -h            Show this help message and exit\n");
   exit(status);
 }
@@ -40,9 +41,10 @@ int main(int argc, char *argv[]) {
   unsigned long long write_limit = 0;
   char *listen_port = NULL;
   char *connect_hostport = NULL;
+  int verbose = 0;
 
   // Parse command line arguments
-  while ((opt = getopt(argc, argv, "i:o:r:w:l:c:h")) != -1) {
+  while ((opt = getopt(argc, argv, "i:o:r:w:l:c:hv")) != -1) {
     switch (opt) {
     case 'i':
       infile = optarg;
@@ -61,6 +63,9 @@ int main(int argc, char *argv[]) {
       break;
     case 'c':
       connect_hostport = optarg;
+      break;
+    case 'v':
+      verbose = 1;
       break;
     case 'h':
       print_usage_and_exit(EXIT_SUCCESS);
@@ -134,14 +139,16 @@ int main(int argc, char *argv[]) {
     }
 
     // Print listening banner
-    if (write_limit > 0) {
-      fprintf(stderr,
-              "netwcat: listening on 0.0.0.0:%s and writing up to %llu bytes "
-              "to %s\n",
-              listen_port, write_limit, display_out);
-    } else {
-      fprintf(stderr, "netwcat: listening on 0.0.0.0:%s and writing to %s\n",
-              listen_port, display_out);
+    if (verbose) {
+      if (write_limit > 0) {
+        fprintf(stderr,
+                "netwcat: listening on 0.0.0.0:%s and writing up to %llu bytes "
+                "to %s\n",
+                listen_port, write_limit, display_out);
+      } else {
+        fprintf(stderr, "netwcat: listening on 0.0.0.0:%s and writing to %s\n",
+                listen_port, display_out);
+      }
     }
 
     struct sockaddr_in client_addr;
@@ -150,6 +157,11 @@ int main(int argc, char *argv[]) {
     if (fd_in < 0) {
       perror("accept");
       exit(EXIT_FAILURE);
+    }
+
+    if (verbose) {
+      fprintf(stderr, "netwcat: connection from %s:%d received\n",
+              inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
     }
 
     close(server_sock); // We only handle one connection
@@ -202,12 +214,15 @@ int main(int argc, char *argv[]) {
     freeaddrinfo(res);
 
     // Print sending banner
-    if (read_limit > 0) {
-      fprintf(stderr, "netwcat: sending from %s %llu bytes to %s\n", display_in,
-              read_limit, connect_hostport);
-    } else {
-      fprintf(stderr, "netwcat: sending from %s to %s\n", display_in,
-              connect_hostport);
+    if (verbose) {
+      fprintf(stderr, "netwcat: connected to %s\n", connect_hostport);
+      if (read_limit > 0) {
+        fprintf(stderr, "netwcat: sending from %s %llu bytes to %s\n",
+                display_in, read_limit, connect_hostport);
+      } else {
+        fprintf(stderr, "netwcat: sending from %s to %s\n", display_in,
+                connect_hostport);
+      }
     }
     free(host);
   }
@@ -281,19 +296,21 @@ int main(int argc, char *argv[]) {
 loop_end:
 
   // Final output messages
-  if (listen_port) {
-    fprintf(stderr,
-            "netwcat: received from port %s and written %llu bytes to %s\n",
-            listen_port, total_written, display_out);
-  } else if (connect_hostport) {
-    if (read_limit > 0 && total_written < read_limit) {
-      fprintf(stderr, "netwcat: %llu received of %llu sent to %s\n",
-              total_written, read_limit, connect_hostport);
-    } else if (read_limit > 0) {
-      fprintf(stderr, "netwcat: %llu bytes sent\n", total_written);
-    } else {
-      fprintf(stderr, "netwcat: %llu bytes sent to %s\n", total_written,
-              connect_hostport);
+  if (verbose) {
+    if (listen_port) {
+      fprintf(stderr,
+              "netwcat: received from port %s and written %llu bytes to %s\n",
+              listen_port, total_written, display_out);
+    } else if (connect_hostport) {
+      if (read_limit > 0 && total_written < read_limit) {
+        fprintf(stderr, "netwcat: %llu received of %llu sent to %s\n",
+                total_written, read_limit, connect_hostport);
+      } else if (read_limit > 0) {
+        fprintf(stderr, "netwcat: %llu bytes sent\n", total_written);
+      } else {
+        fprintf(stderr, "netwcat: %llu bytes sent to %s\n", total_written,
+                connect_hostport);
+      }
     }
   }
 
