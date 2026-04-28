@@ -30,6 +30,7 @@ void print_usage_and_exit(int status) {
   fprintf(stream, "    -w BYTES      Stop writing after WRITELIMIT bytes\n");
   fprintf(stream, "    -v            Verbose mode (show status messages)\n");
   fprintf(stream, "    -h            Show this help message and exit\n");
+  fprintf(stream, "\n©️ 2026, Ramón Barrios Láscar.\n");
   exit(status);
 }
 
