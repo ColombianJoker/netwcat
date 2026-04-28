@@ -21,6 +21,7 @@ Options:
 -o FILE Write to OUTPUTFILE (default: stdout)
 -r BYTES Stop reading after READLIMIT bytes
 -w BYTES Stop writing after WRITELIMIT bytes
+-v            Verbose output (show connection and transfer messages)
 -h Show this help message and exit
 ```
 
@@ -33,14 +34,16 @@ Send exactly 1MB of zeroes from Host B to a file on Host A.
 #### On Host A (serving/listening):
 
 ```sh
-$ netwcat -l 1522 -o /tmp/test.1.bin
+$ netwcat -l 1522 -o /tmp/test.1.bin -v
 netwcat: listening on 0.0.0.0:1522 and writing to /tmp/test.1.bin
+netwcat: connection from 192.168.1.50:43812 received
 ```
 
 #### On Host B (client/sending):
 
 ```sh
-$ netwcat -c host_A:1522 -r 1048576 -i /dev/zero
+$ netwcat -c host_A:1522 -r 1048576 -i /dev/zero -v
+netwcat: connected to host_A:1522
 netwcat: sending from /dev/zero 1048576 bytes to host_A:1522
 netwcat: 1048576 bytes sent
 ```
@@ -52,14 +55,16 @@ Host A listens and stops writing after exactly 512KB. Host B attempts to send 1M
 #### On Host A:
 
 ```sh
-$ netwcat -l 1522 -w 524288 > /tmp/test2.bin
+$ netwcat -l 1522 -w 524288 -v > /tmp/test2.bin
 netwcat: listening on 0.0.0.0:1522 and writing up to 524288 bytes to stdout
+netwcat: connection from 192.168.1.50:43814 received
 ```
 
 #### On Host B:
 
 ```sh
-$ netwcat -c host_A:1522 -r 1048576 < /dev/zero
+$ netwcat -c host_A:1522 -r 1048576 -v < /dev/zero
+netwcat: connected to host_A:1522
 netwcat: sending from stdin 1048576 bytes to host_A:1522
 netwcat: 524288 received of 1048576 sent to host_A:1522
 ```
