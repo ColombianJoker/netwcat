@@ -14,13 +14,22 @@
 
 #define BUFFER_SIZE 32768
 
-void print_usage_and_exit() {
-  fprintf(stderr, "Usage:\n");
-  fprintf(stderr, "  Server mode: netwcat -l PORT [-o FILE] [-w WRITELIMIT] "
+void print_usage_and_exit(int status) {
+  FILE *stream = (status == EXIT_SUCCESS) ? stdout : stderr;
+  fprintf(stream, "Usage:\n");
+  fprintf(stream, "  Server mode: netwcat -l PORT [-o FILE] [-w WRITELIMIT] "
                   "[-r READLIMIT]\n");
-  fprintf(stderr, "  Client mode: netwcat -c HOST:PORT [-i FILE] [-w "
+  fprintf(stream, "  Client mode: netwcat -c HOST:PORT [-i FILE] [-w "
                   "WRITELIMIT] [-r READLIMIT]\n");
-  exit(EXIT_FAILURE);
+  fprintf(stream, "  Options:\n");
+  fprintf(stream, "    -l PORT       Listen on local TCP port\n");
+  fprintf(stream, "    -c HOST:PORT  Connect to remote HOST and PORT\n");
+  fprintf(stream, "    -i FILE       Read from INPUTFILE (default: stdin)\n");
+  fprintf(stream, "    -o FILE       Write to OUTPUTFILE (default: stdout)\n");
+  fprintf(stream, "    -r BYTES      Stop reading after READLIMIT bytes\n");
+  fprintf(stream, "    -w BYTES      Stop writing after WRITELIMIT bytes\n");
+  fprintf(stream, "    -h            Show this help message and exit\n");
+  exit(status);
 }
 
 int main(int argc, char *argv[]) {
@@ -33,7 +42,7 @@ int main(int argc, char *argv[]) {
   char *connect_hostport = NULL;
 
   // Parse command line arguments
-  while ((opt = getopt(argc, argv, "i:o:r:w:l:c:")) != -1) {
+  while ((opt = getopt(argc, argv, "i:o:r:w:l:c:h")) != -1) {
     switch (opt) {
     case 'i':
       infile = optarg;
@@ -53,8 +62,11 @@ int main(int argc, char *argv[]) {
     case 'c':
       connect_hostport = optarg;
       break;
+    case 'h':
+      print_usage_and_exit(EXIT_SUCCESS);
+      break;
     default:
-      print_usage_and_exit();
+      print_usage_and_exit(EXIT_FAILURE);
     }
   }
 
