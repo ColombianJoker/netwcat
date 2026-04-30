@@ -12,8 +12,9 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#define BUFFER_SIZE 32768
-#define PROG_NAME "netwcat"
+// Safe datagram size to avoid EMSGSIZE on strict operating systems
+#define BUFFER_SIZE 8192
+#define PROG_NAME "neuwcat"
 
 #ifndef NI_MAXHOST
 #define NI_MAXHOST 1025
@@ -21,6 +22,11 @@
 #ifndef NI_MAXSERV
 #define NI_MAXSERV 32
 #endif
+
+// Global flag for graceful termination
+volatile sig_atomic_t keep_running = 1;
+
+void graceful_shutdown(int signo) { keep_running = 0; }
 
 void print_usage_and_exit(int status) {
   FILE *stream = (status == EXIT_SUCCESS) ? stdout : stderr;
@@ -31,12 +37,12 @@ void print_usage_and_exit(int status) {
   fprintf(stream, "  Client mode: " PROG_NAME " -c HOST:PORT [-i FILE] [-w "
                   "WRITELIMIT] [-r READLIMIT] [-v]\n");
   fprintf(stream, "  Options:\n");
-  fprintf(stream, "    -l PORT       Listen on local TCP port\n");
-  fprintf(stream, "    -c HOST:PORT  Connect to remote HOST and PORT\n");
-  fprintf(stream, "    -i INPUT      Read from INPUT (default: stdin)\n");
-  fprintf(stream, "    -o OUTPUT     Write to OUTPUT (default: stdout)\n");
-  fprintf(stream, "    -r BYTES      Stop reading after LIMIT bytes\n");
-  fprintf(stream, "    -w BYTES      Stop writing after LIMIT bytes\n");
+  fprintf(stream, "    -l PORT       Listen on local UDP port\n");
+  fprintf(stream, "    -c HOST:PORT  Send to remote HOST and UDP PORT\n");
+  fprintf(stream, "    -i INPUT      Read from INPUTFILE (default: stdin)\n");
+  fprintf(stream, "    -o OUTPUT     Write to OUTPUTFILE (default: stdout)\n");
+  fprintf(stream, "    -r BYTES      Stop reading after READLIMIT bytes\n");
+  fprintf(stream, "    -w BYTES      Stop writing after WRITELIMIT bytes\n");
   fprintf(stream, "    -v            Verbose mode (show status messages)\n");
   fprintf(stream, "    -h            Show this help message and exit\n");
 #ifdef BUILD_TIMESTAMP
@@ -110,21 +116,27 @@ int main(int argc, char *argv[]) {
     exit(EXIT_FAILURE);
   }
 
-  // Ignore SIGPIPE so writing to a closed socket doesn't crash the program
-  signal(SIGPIPE, SIG_IGN);
+  // Gracefully handle termination signals
+  struct sigaction sa;
+  sa.sa_handler = graceful_shutdown;
+  sigemptyset(&sa.sa_mask);
+  sa.sa_flags = 0;               // We want read/write to be interrupted (EINTR)
+  sigaction(SIGHUP, &sa, NULL);  // kill -1
+  sigaction(SIGINT, &sa, NULL);  // Ctrl+C
+  sigaction(SIGTERM, &sa, NULL); // kill -15
 
   int fd_in = -1;
   int fd_out = -1;
   char *display_in = "stdin";
   char *display_out = "stdout";
 
-  // Setup Server Mode
+  // Setup Server Mode (UDP Receive)
   if (listen_port) {
     struct addrinfo hints, *res, *p;
     memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC;     // Allow IPv4 or IPv6
-    hints.ai_socktype = SOCK_STREAM; // TCP socket
-    hints.ai_flags = AI_PASSIVE; // Bind to the wildcard address (0.0.0.0 or ::)
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_DGRAM; // Changed to UDP
+    hints.ai_flags = AI_PASSIVE;
 
     if (getaddrinfo(NULL, listen_port, &hints, &res) != 0) {
       fprintf(stderr, PROG_NAME ": error: failed to resolve listen address\n");
@@ -132,7 +144,6 @@ int main(int argc, char *argv[]) {
     }
 
     int server_sock = -1;
-    // Loop through results and bind to the first one that works
     for (p = res; p != NULL; p = p->ai_next) {
       server_sock = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
       if (server_sock < 0)
@@ -142,7 +153,6 @@ int main(int argc, char *argv[]) {
       setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR, &optval,
                  sizeof(optval));
 
-      // If IPv6, turn off IPV6_V6ONLY to ensure we also accept IPv4 clients
       if (p->ai_family == AF_INET6) {
         int no = 0;
         setsockopt(server_sock, IPPROTO_IPV6, IPV6_V6ONLY, &no, sizeof(no));
@@ -155,21 +165,18 @@ int main(int argc, char *argv[]) {
     }
 
     if (p == NULL) {
-      fprintf(stderr, PROG_NAME ": error: failed to bind to port %s\n",
+      fprintf(stderr, PROG_NAME ": error: failed to bind to UDP port %s\n",
               listen_port);
       exit(EXIT_FAILURE);
     }
 
-    // Determine which IP family we actually bound to for logging
     int is_ipv6 = (p->ai_family == AF_INET6);
     freeaddrinfo(res);
 
-    if (listen(server_sock, 1) < 0) {
-      perror(PROG_NAME ": listen");
-      exit(EXIT_FAILURE);
-    }
+    // UDP does not use listen() or accept()
+    // The server reads directly from the bound socket.
+    fd_in = server_sock;
 
-    // Output file resolution
     if (outfile && strcmp(outfile, "-") != 0) {
       fd_out = open(outfile, O_WRONLY | O_CREAT | O_TRUNC, 0666);
       if (fd_out < 0) {
@@ -181,52 +188,41 @@ int main(int argc, char *argv[]) {
       fd_out = STDOUT_FILENO;
     }
 
-    // Print listening banner
     if (verbose) {
       const char *bind_addr = is_ipv6 ? "::" : "0.0.0.0";
       if (write_limit > 0) {
         fprintf(stderr,
                 PROG_NAME
-                ": listening on %s:%s and writing up to %llu bytes to %s\n",
+                ": listening on UDP %s:%s and writing up to %llu bytes to %s\n",
                 bind_addr, listen_port, write_limit, display_out);
       } else {
-        fprintf(stderr, PROG_NAME ": listening on %s:%s and writing to %s\n",
+        fprintf(stderr,
+                PROG_NAME ": listening on UDP %s:%s and writing to %s\n",
                 bind_addr, listen_port, display_out);
       }
-    }
 
-    // Use sockaddr_storage to ensure we have enough memory to hold an IPv6
-    // address
-    struct sockaddr_storage client_addr;
-    socklen_t client_len = sizeof(client_addr);
-    fd_in = accept(server_sock, (struct sockaddr *)&client_addr, &client_len);
-    if (fd_in < 0) {
-      perror(PROG_NAME ": accept");
-      exit(EXIT_FAILURE);
-    }
+      // Block until the first UDP datagram arrives to grab the sender's IP
+      struct sockaddr_storage client_addr;
+      socklen_t client_len = sizeof(client_addr);
+      char peek_buf[1];
 
-    if (verbose) {
-      char host_str[NI_MAXHOST];
-      char port_str[NI_MAXSERV];
-      // getnameinfo converts the raw binary address into readable strings for
-      // both IPv4 and IPv6
-      if (getnameinfo((struct sockaddr *)&client_addr, client_len, host_str,
-                      sizeof(host_str), port_str, sizeof(port_str),
-                      NI_NUMERICHOST | NI_NUMERICSERV) == 0) {
-        fprintf(stderr, PROG_NAME ": connection from %s:%s received\n",
-                host_str, port_str);
-      } else {
-        fprintf(stderr,
-                PROG_NAME ": connection from unknown client received\n");
+      // MSG_PEEK lets us look at the packet without removing it from the OS
+      // queue
+      if (recvfrom(server_sock, peek_buf, 1, MSG_PEEK,
+                   (struct sockaddr *)&client_addr, &client_len) >= 0) {
+        char host_str[NI_MAXHOST], port_str[NI_MAXSERV];
+        if (getnameinfo((struct sockaddr *)&client_addr, client_len, host_str,
+                        sizeof(host_str), port_str, sizeof(port_str),
+                        NI_NUMERICHOST | NI_NUMERICSERV) == 0) {
+          fprintf(stderr, PROG_NAME ": receiving datagrams from %s:%s\n",
+                  host_str, port_str);
+        }
       }
     }
-
-    close(server_sock); // We only handle one connection
   }
 
-  // Setup Client Mode
+  // Setup Client Mode (UDP Send)
   if (connect_hostport) {
-    // Parse host and port
     char *host = strdup(connect_hostport);
     char *port = strchr(host, ':');
     if (!port) {
@@ -236,7 +232,6 @@ int main(int argc, char *argv[]) {
     *port = '\0';
     port++;
 
-    // Input file resolution
     if (infile && strcmp(infile, "-") != 0) {
       fd_in = open(infile, O_RDONLY);
       if (fd_in < 0) {
@@ -250,22 +245,23 @@ int main(int argc, char *argv[]) {
 
     struct addrinfo hints, *res, *p;
     memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC; // Allow IPv4 or IPv6
-    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_DGRAM; // Changed to UDP
 
     if (getaddrinfo(host, port, &hints, &res) != 0) {
       fprintf(stderr, PROG_NAME ": error: failed to resolve host %s\n", host);
       exit(EXIT_FAILURE);
     }
 
-    // Loop through results to connect
     for (p = res; p != NULL; p = p->ai_next) {
       fd_out = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
       if (fd_out < 0)
         continue;
 
+      // Connecting a UDP socket binds the default destination address
+      // allowing us to use standard write() instead of sendto()
       if (connect(fd_out, p->ai_addr, p->ai_addrlen) == 0) {
-        break; // Successfully connected
+        break;
       }
       close(fd_out);
       fd_out = -1;
@@ -279,9 +275,8 @@ int main(int argc, char *argv[]) {
 
     freeaddrinfo(res);
 
-    // Print sending banner
     if (verbose) {
-      fprintf(stderr, PROG_NAME ": connected to %s:%s\n", host, port);
+      fprintf(stderr, PROG_NAME ": UDP target set to %s:%s\n", host, port);
       if (read_limit > 0) {
         fprintf(stderr, PROG_NAME ": sending from %s %llu bytes to %s:%s\n",
                 display_in, read_limit, host, port);
@@ -298,57 +293,64 @@ int main(int argc, char *argv[]) {
   unsigned long long total_written = 0;
   char buffer[BUFFER_SIZE];
 
-  while (1) {
+  while (keep_running) {
     size_t bytes_to_read = BUFFER_SIZE;
 
-    // Apply read limit
     if (read_limit > 0 && (read_limit - total_read) < bytes_to_read) {
       bytes_to_read = read_limit - total_read;
     }
     if (read_limit > 0 && bytes_to_read == 0) {
-      break; // Read limit reached
+      break;
     }
-
-    // Short-circuit if write limit is already reached
     if (write_limit > 0 && total_written >= write_limit) {
       break;
     }
 
     ssize_t n_read = read(fd_in, buffer, bytes_to_read);
     if (n_read < 0) {
-      if (errno == EINTR)
+      if (errno == EINTR) {
+        if (!keep_running)
+          break;
         continue;
+      }
       perror(PROG_NAME ": read error");
       break;
     }
+
     if (n_read == 0) {
-      break; // EOF
+      if (listen_port) {
+        // In UDP, reading 0 bytes means an empty datagram was received.
+        // It does not mean EOF. Keep listening.
+        continue;
+      } else {
+        // If client, 0 bytes from local file/stdin means actual EOF.
+        break;
+      }
     }
 
     total_read += n_read;
-
-    // Write what was read
     char *ptr = buffer;
     ssize_t remaining = n_read;
 
-    // Truncate write block if write limit will be exceeded
     if (write_limit > 0 && (total_written + remaining) > write_limit) {
       remaining = write_limit - total_written;
     }
 
-    while (remaining > 0) {
+    while (remaining > 0 && keep_running) {
       ssize_t n_written = write(fd_out, ptr, remaining);
       if (n_written < 0) {
-        if (errno == EINTR)
+        if (errno == EINTR) {
+          if (!keep_running)
+            goto loop_end;
           continue;
-        if (errno != EPIPE) {
-          // EPIPE is expected if remote closes connection early
-          perror(PROG_NAME ": write error");
         }
+        // UDP does not have EPIPE, but might throw ECONNREFUSED if ICMP
+        // port unreachable is received on a connected UDP socket.
+        perror(PROG_NAME ": write error");
         goto loop_end;
       }
       if (n_written == 0)
-        goto loop_end; // Should not happen in blocking mode
+        goto loop_end;
 
       total_written += n_written;
       ptr += n_written;
@@ -366,7 +368,7 @@ loop_end:
     if (listen_port) {
       fprintf(stderr,
               PROG_NAME
-              ": received from port %s and written %llu bytes to %s\n",
+              ": received from UDP port %s and written %llu bytes to %s\n",
               listen_port, total_written, display_out);
     } else if (connect_hostport) {
       if (read_limit > 0 && total_written < read_limit) {
