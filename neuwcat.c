@@ -46,13 +46,15 @@ void print_usage_and_exit(int status) {
   fprintf(stream, "    -v            Verbose mode (show status messages)\n");
   fprintf(stream, "    -h            Show this help message and exit\n");
 #ifdef BUILD_TIMESTAMP
-  fprintf(stream, "\n  Compiled on: %s\n", BUILD_TIMESTAMP);
+  fprintf(stream, "\n  Compiled on: %s. ©️ 2026, Ramón Barrios Láscar.\n",
+          BUILD_TIMESTAMP);
 #else
   // Fallback just in case you compile without the flag
-  fprintf(stream, "\n  Compiled on: %s %s\n", __DATE__, __TIME__);
+  fprintf(stream, "\n  Compiled on: %s %s. ©️ 2026, Ramón Barrios Láscar.\n",
+          __DATE__, __TIME__);
 #endif
 
-  fprintf(stream, "\n©️ 2026, Ramón Barrios Láscar.\n");
+  fprintf(stream, "\n");
   exit(status);
 }
 
