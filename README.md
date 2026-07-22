@@ -8,6 +8,8 @@ Simple `netcat` lookalike
 $ gcc -O2 -m64 netwcat.c -o netwcat
 ```
 
+_Multi-threaded_ programs. These use a thread to send or receive from the network socket and another thread to read or write on the local file. Use the environment variable `CAT_BUFFER_SIZE` to size the internal memory buffer (`>10MB` recommended).
+
 ## Usage
 
 ```text
