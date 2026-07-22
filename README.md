@@ -5,10 +5,17 @@ Simple `netcat` lookalike
 ## Using GCC (Linux, macOS, AIX Toolbox):
 
 ```sh
-$ gcc -O2 -m64 netwcat.c -o netwcat
+$ gcc -O2 -m64 -pthread netwcat.c -o netwcat
 ```
 
-_Multi-threaded_ programs. These use a thread to send or receive from the network socket and another thread to read or write on the local file. Use the environment variable `CAT_BUFFER_SIZE` to size the internal memory buffer (`>10MB` recommended).
+or even better
+
+```sh
+$ gcc -O2 -m64 -pthread -arch arm64 -arch x86_64 -o netwcat-mac-universal -DBUILD_TIMESTAMP="\"$(date +'%Y-%m-%d %H:%M:%S')\"" netwcat.c
+$ gcc -O2 -m64 -pthread -arch arm64 -arch x86_64 -o neuwcat-mac-universal -DBUILD_TIMESTAMP="\"$(date +'%Y-%m-%d %H:%M:%S')\"" neuwcat.c
+```
+
+_Multi-threaded_ programs. These use a thread to send or receive from the network socket and another thread to read or write on the local file. Use the environment variable `CAT_BUFFER_SIZE` to size the internal memory buffer (`CAT_BUFFER_SIZE >= 10 485 760` recommended).
 
 ## Usage
 
