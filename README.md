@@ -4,6 +4,10 @@ Simple `netcat` lookalike
 
 ## Using GCC (Linux, macOS, AIX Toolbox):
 
+## Compiling
+
+Simple
+
 ```sh
 $ gcc -O2 -m64 -pthread netwcat.c -o netwcat
 ```
@@ -19,19 +23,46 @@ _Multi-threaded_ programs. These use a thread to send or receive from the networ
 
 ## Usage
 
+### Neuwcat
+
 ```text
+neuwcat-mac-universal
+neuwcat: error: must specify either -l or -c
 Usage:
-Server mode: netwcat -l PORT [-o FILE] [-w WRITELIMIT] [-r READLIMIT]
-Client mode: netwcat -c HOST:PORT [-i FILE] [-w WRITELIMIT] [-r READLIMIT]
-Options:
--l PORT Listen on local TCP port
--c HOST:PORT Connect to remote HOST and PORT
--i FILE Read from INPUTFILE (default: stdin)
--o FILE Write to OUTPUTFILE (default: stdout)
--r BYTES Stop reading after READLIMIT bytes
--w BYTES Stop writing after WRITELIMIT bytes
--v            Verbose output (show connection and transfer messages)
--h Show this help message and exit
+  Server mode: neuwcat -l PORT [-o FILE] [-w WRITELIMIT] [-r READLIMIT] [-v]
+  Client mode: neuwcat -c HOST:PORT [-i FILE] [-w WRITELIMIT] [-r READLIMIT] [-v]
+  Options:
+    -l PORT       Listen on local UDP port
+    -c HOST:PORT  Send to remote HOST and UDP PORT
+    -i INPUT      Read from INPUTFILE (default: stdin)
+    -o OUTPUT     Write to OUTPUTFILE (default: stdout)
+    -r BYTES      Stop reading after READLIMIT bytes
+    -w BYTES      Stop writing after WRITELIMIT bytes
+    -v            Verbose mode (show status messages)
+    -h            Show this help message and exit
+
+  Compiled on: 2026-07-22 15:05:24. ©️ 2026, Ramón Barrios Láscar.
+```
+
+### Netwcat
+
+```text
+/netwcat-mac-universal
+netwcat: error: must specify either -l or -c
+Usage:
+  Server mode: netwcat -l PORT [-o FILE] [-w WRITELIMIT] [-r READLIMIT] [-v]
+  Client mode: netwcat -c HOST:PORT [-i FILE] [-w WRITELIMIT] [-r READLIMIT] [-v]
+  Options:
+    -l PORT       Listen on local TCP port
+    -c HOST:PORT  Connect to remote HOST and PORT
+    -i INPUT      Read from INPUT (default: stdin)
+    -o OUTPUT     Write to OUTPUT (default: stdout)
+    -r BYTES      Stop reading after LIMIT bytes
+    -w BYTES      Stop writing after LIMIT bytes
+    -v            Verbose mode (show status messages)
+    -h            Show this help message and exit
+
+  Compiled on: 2026-07-22 15:38:30. ©️ 2026, Ramón Barrios Láscar.
 ```
 
 ## Examples
