@@ -1,6 +1,6 @@
 # netwcat
 
-Simple `netcat` lookalike
+Simple `netcat` lookalike, tools to open a local TCP (`netwcat`) or UDP (`neuwcat`) port and receive and save the bytes to a local file (or to stdout); and to open a connection to a remote TCP (`netwcat`) or UDP (`neuwcat`) port and send the contents of a local file (or stdin).
 
 ## Using GCC (Linux, macOS, AIX Toolbox):
 
