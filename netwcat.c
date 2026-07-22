@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,14 +23,186 @@
 #define NI_MAXSERV 32
 #endif
 
+// Global flag for graceful termination
+volatile sig_atomic_t keep_running = 1;
+
+void graceful_shutdown(int signo) { keep_running = 0; }
+
+// --- Threaded Ring Buffer Structures & Helpers ---
+
+typedef struct {
+  char *data;
+  size_t capacity;
+  size_t head;
+  size_t tail;
+  size_t count;
+  pthread_mutex_t lock;
+  pthread_cond_t not_empty;
+  pthread_cond_t not_full;
+  int producer_done;
+  int fd_in;
+  int fd_out;
+  unsigned long long read_limit;
+  unsigned long long write_limit;
+  unsigned long long total_read;
+  unsigned long long total_written;
+} RingBuffer;
+
+// Writes to ring buffer handling wrap-around
+void rb_write(RingBuffer *rb, const char *data, size_t len) {
+  size_t space_to_end = rb->capacity - rb->head;
+  if (len <= space_to_end) {
+    memcpy(rb->data + rb->head, data, len);
+  } else {
+    memcpy(rb->data + rb->head, data, space_to_end);
+    memcpy(rb->data, data + space_to_end, len - space_to_end);
+  }
+  rb->head = (rb->head + len) % rb->capacity;
+  rb->count += len;
+}
+
+// Reads from ring buffer handling wrap-around
+void rb_read(RingBuffer *rb, char *data, size_t len) {
+  size_t space_to_end = rb->capacity - rb->tail;
+  if (len <= space_to_end) {
+    memcpy(data, rb->data + rb->tail, len);
+  } else {
+    memcpy(data, rb->data + rb->tail, space_to_end);
+    memcpy(data + space_to_end, rb->data, len - space_to_end);
+  }
+  rb->tail = (rb->tail + len) % rb->capacity;
+  rb->count -= len;
+}
+
+// --- Threads ---
+
+void *producer_thread(void *arg) {
+  RingBuffer *rb = (RingBuffer *)arg;
+  char temp[BUFFER_SIZE];
+
+  while (keep_running) {
+    size_t bytes_to_read = BUFFER_SIZE;
+
+    if (rb->read_limit > 0 &&
+        (rb->read_limit - rb->total_read) < bytes_to_read) {
+      bytes_to_read = rb->read_limit - rb->total_read;
+    }
+    if (rb->read_limit > 0 && bytes_to_read == 0)
+      break;
+    if (rb->write_limit > 0 && rb->total_written >= rb->write_limit)
+      break;
+
+    ssize_t n_read = read(rb->fd_in, temp, bytes_to_read);
+    if (n_read < 0) {
+      if (errno == EINTR) {
+        if (!keep_running)
+          break;
+        continue;
+      }
+      perror(PROG_NAME ": read error");
+      break;
+    }
+
+    if (n_read == 0) {
+      break; // EOF reached (Connection closed or file ended)
+    }
+
+    // Push to Ring Buffer
+    pthread_mutex_lock(&rb->lock);
+    while (rb->capacity - rb->count < (size_t)n_read && keep_running) {
+      pthread_cond_wait(&rb->not_full, &rb->lock);
+    }
+    if (!keep_running) {
+      pthread_mutex_unlock(&rb->lock);
+      break;
+    }
+
+    rb_write(rb, temp, n_read);
+    rb->total_read += n_read;
+    pthread_cond_signal(&rb->not_empty);
+    pthread_mutex_unlock(&rb->lock);
+  }
+
+  pthread_mutex_lock(&rb->lock);
+  rb->producer_done = 1;
+  pthread_cond_broadcast(&rb->not_empty);
+  pthread_mutex_unlock(&rb->lock);
+  return NULL;
+}
+
+void *consumer_thread(void *arg) {
+  RingBuffer *rb = (RingBuffer *)arg;
+  char temp[BUFFER_SIZE];
+
+  while (keep_running) {
+    pthread_mutex_lock(&rb->lock);
+    while (rb->count == 0 && !rb->producer_done && keep_running) {
+      pthread_cond_wait(&rb->not_empty, &rb->lock);
+    }
+    if (rb->count == 0 && (rb->producer_done || !keep_running)) {
+      pthread_mutex_unlock(&rb->lock);
+      break;
+    }
+
+    size_t to_write = (rb->count < BUFFER_SIZE) ? rb->count : BUFFER_SIZE;
+    if (rb->write_limit > 0 &&
+        (rb->total_written + to_write) > rb->write_limit) {
+      to_write = rb->write_limit - rb->total_written;
+    }
+
+    rb_read(rb, temp, to_write);
+    pthread_cond_signal(&rb->not_full);
+    pthread_mutex_unlock(&rb->lock);
+
+    // Send TCP packets or write to file
+    char *ptr = temp;
+    ssize_t remaining = to_write;
+
+    while (remaining > 0 && keep_running) {
+      ssize_t n_written = write(rb->fd_out, ptr, remaining);
+      if (n_written < 0) {
+        if (errno == EINTR) {
+          if (!keep_running)
+            goto exit_consumer;
+          continue;
+        }
+        if (errno != EPIPE) {
+          perror(PROG_NAME ": write error");
+        }
+        goto exit_consumer;
+      }
+      if (n_written == 0)
+        goto exit_consumer;
+
+      rb->total_written += n_written;
+      ptr += n_written;
+      remaining -= n_written;
+    }
+
+    if (rb->write_limit > 0 && rb->total_written >= rb->write_limit) {
+      break;
+    }
+  }
+
+exit_consumer:
+  // If consumer dies early, wake up producer to exit safely
+  pthread_mutex_lock(&rb->lock);
+  keep_running = 0;
+  pthread_cond_broadcast(&rb->not_full);
+  pthread_mutex_unlock(&rb->lock);
+  return NULL;
+}
+
+// --- Main Program ---
+
 void print_usage_and_exit(int status) {
   FILE *stream = (status == EXIT_SUCCESS) ? stdout : stderr;
   fprintf(stream, "Usage:\n");
+  fprintf(stream, "  Server mode: " PROG_NAME
+                  " -l PORT [-o FILE] [-w WRITELIMIT] [-r READLIMIT] [-v]\n");
   fprintf(stream,
-          "  Server mode: " PROG_NAME " -l PORT [-o FILE] [-w WRITELIMIT] "
-          "[-r READLIMIT] [-v]\n");
-  fprintf(stream, "  Client mode: " PROG_NAME " -c HOST:PORT [-i FILE] [-w "
-                  "WRITELIMIT] [-r READLIMIT] [-v]\n");
+          "  Client mode: " PROG_NAME
+          " -c HOST:PORT [-i FILE] [-w WRITELIMIT] [-r READLIMIT] [-v]\n");
   fprintf(stream, "  Options:\n");
   fprintf(stream, "    -l PORT       Listen on local TCP port\n");
   fprintf(stream, "    -c HOST:PORT  Connect to remote HOST and PORT\n");
@@ -43,11 +216,9 @@ void print_usage_and_exit(int status) {
   fprintf(stream, "\n  Compiled on: %s. ©️ 2026, Ramón Barrios Láscar.\n",
           BUILD_TIMESTAMP);
 #else
-  // Fallback just in case you compile without the flag
   fprintf(stream, "\n  Compiled on: %s %s. ©️ 2026, Ramón Barrios Láscar.\n",
           __DATE__, __TIME__);
 #endif
-
   fprintf(stream, "\n");
   exit(status);
 }
@@ -62,7 +233,6 @@ int main(int argc, char *argv[]) {
   char *connect_hostport = NULL;
   int verbose = 0;
 
-  // Parse command line arguments
   while ((opt = getopt(argc, argv, "i:o:r:w:l:c:hv")) != -1) {
     switch (opt) {
     case 'i':
@@ -94,39 +264,40 @@ int main(int argc, char *argv[]) {
     }
   }
 
-  // Validation
   if (listen_port && connect_hostport) {
     fprintf(stderr, PROG_NAME ": error: cannot use both -l and -c\n");
-    fprintf(stderr, "©️ 2026, Ramón Barrios Láscar.\n");
     exit(EXIT_FAILURE);
   }
   if (!listen_port && !connect_hostport) {
     fprintf(stderr, PROG_NAME ": error: must specify either -l or -c\n");
-    fprintf(stderr, "©️ 2026, Ramón Barrios Láscar.\n");
-    exit(EXIT_FAILURE);
+    print_usage_and_exit(EXIT_FAILURE);
   }
   if (listen_port && infile) {
     fprintf(stderr, PROG_NAME
             ": error: cannot use -i with -l (server mode only receives)\n");
-    fprintf(stderr, "©️ 2026, Ramón Barrios Láscar.\n");
     exit(EXIT_FAILURE);
   }
 
-  // Ignore SIGPIPE so writing to a closed socket doesn't crash the program
+  // Gracefully handle termination signals and ignore SIGPIPE for TCP
   signal(SIGPIPE, SIG_IGN);
+  struct sigaction sa;
+  sa.sa_handler = graceful_shutdown;
+  sigemptyset(&sa.sa_mask);
+  sa.sa_flags = 0;
+  sigaction(SIGHUP, &sa, NULL);
+  sigaction(SIGINT, &sa, NULL);
+  sigaction(SIGTERM, &sa, NULL);
 
-  int fd_in = -1;
-  int fd_out = -1;
-  char *display_in = "stdin";
-  char *display_out = "stdout";
+  int fd_in = -1, fd_out = -1;
+  char *display_in = "stdin", *display_out = "stdout";
 
   // Setup Server Mode
   if (listen_port) {
     struct addrinfo hints, *res, *p;
     memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC;     // Allow IPv4 or IPv6
-    hints.ai_socktype = SOCK_STREAM; // TCP socket
-    hints.ai_flags = AI_PASSIVE; // Bind to the wildcard address (0.0.0.0 or ::)
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_PASSIVE;
 
     if (getaddrinfo(NULL, listen_port, &hints, &res) != 0) {
       fprintf(stderr, PROG_NAME ": error: failed to resolve listen address\n");
@@ -134,7 +305,6 @@ int main(int argc, char *argv[]) {
     }
 
     int server_sock = -1;
-    // Loop through results and bind to the first one that works
     for (p = res; p != NULL; p = p->ai_next) {
       server_sock = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
       if (server_sock < 0)
@@ -143,26 +313,20 @@ int main(int argc, char *argv[]) {
       int optval = 1;
       setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR, &optval,
                  sizeof(optval));
-
-      // If IPv6, turn off IPV6_V6ONLY to ensure we also accept IPv4 clients
       if (p->ai_family == AF_INET6) {
         int no = 0;
         setsockopt(server_sock, IPPROTO_IPV6, IPV6_V6ONLY, &no, sizeof(no));
       }
-
-      if (bind(server_sock, p->ai_addr, p->ai_addrlen) == 0) {
-        break; // Successfully bound
-      }
+      if (bind(server_sock, p->ai_addr, p->ai_addrlen) == 0)
+        break;
       close(server_sock);
     }
 
     if (p == NULL) {
-      fprintf(stderr, PROG_NAME ": error: failed to bind to port %s\n",
+      fprintf(stderr, PROG_NAME ": error: failed to bind to TCP port %s\n",
               listen_port);
       exit(EXIT_FAILURE);
     }
-
-    // Determine which IP family we actually bound to for logging
     int is_ipv6 = (p->ai_family == AF_INET6);
     freeaddrinfo(res);
 
@@ -171,7 +335,6 @@ int main(int argc, char *argv[]) {
       exit(EXIT_FAILURE);
     }
 
-    // Output file resolution
     if (outfile && strcmp(outfile, "-") != 0) {
       fd_out = open(outfile, O_WRONLY | O_CREAT | O_TRUNC, 0666);
       if (fd_out < 0) {
@@ -183,22 +346,12 @@ int main(int argc, char *argv[]) {
       fd_out = STDOUT_FILENO;
     }
 
-    // Print listening banner
     if (verbose) {
       const char *bind_addr = is_ipv6 ? "::" : "0.0.0.0";
-      if (write_limit > 0) {
-        fprintf(stderr,
-                PROG_NAME
-                ": listening on %s:%s and writing up to %llu bytes to %s\n",
-                bind_addr, listen_port, write_limit, display_out);
-      } else {
-        fprintf(stderr, PROG_NAME ": listening on %s:%s and writing to %s\n",
-                bind_addr, listen_port, display_out);
-      }
+      fprintf(stderr, PROG_NAME ": listening on TCP %s:%s and writing to %s\n",
+              bind_addr, listen_port, display_out);
     }
 
-    // Use sockaddr_storage to ensure we have enough memory to hold an IPv6
-    // address
     struct sockaddr_storage client_addr;
     socklen_t client_len = sizeof(client_addr);
     fd_in = accept(server_sock, (struct sockaddr *)&client_addr, &client_len);
@@ -208,27 +361,19 @@ int main(int argc, char *argv[]) {
     }
 
     if (verbose) {
-      char host_str[NI_MAXHOST];
-      char port_str[NI_MAXSERV];
-      // getnameinfo converts the raw binary address into readable strings for
-      // both IPv4 and IPv6
+      char host_str[NI_MAXHOST], port_str[NI_MAXSERV];
       if (getnameinfo((struct sockaddr *)&client_addr, client_len, host_str,
                       sizeof(host_str), port_str, sizeof(port_str),
                       NI_NUMERICHOST | NI_NUMERICSERV) == 0) {
         fprintf(stderr, PROG_NAME ": connection from %s:%s received\n",
                 host_str, port_str);
-      } else {
-        fprintf(stderr,
-                PROG_NAME ": connection from unknown client received\n");
       }
     }
-
-    close(server_sock); // We only handle one connection
+    close(server_sock); // Close listener, we only handle one client
   }
 
   // Setup Client Mode
   if (connect_hostport) {
-    // Parse host and port
     char *host = strdup(connect_hostport);
     char *port = strchr(host, ':');
     if (!port) {
@@ -238,7 +383,6 @@ int main(int argc, char *argv[]) {
     *port = '\0';
     port++;
 
-    // Input file resolution
     if (infile && strcmp(infile, "-") != 0) {
       fd_in = open(infile, O_RDONLY);
       if (fd_in < 0) {
@@ -252,7 +396,7 @@ int main(int argc, char *argv[]) {
 
     struct addrinfo hints, *res, *p;
     memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC; // Allow IPv4 or IPv6
+    hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
 
     if (getaddrinfo(host, port, &hints, &res) != 0) {
@@ -260,15 +404,12 @@ int main(int argc, char *argv[]) {
       exit(EXIT_FAILURE);
     }
 
-    // Loop through results to connect
     for (p = res; p != NULL; p = p->ai_next) {
       fd_out = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
       if (fd_out < 0)
         continue;
-
-      if (connect(fd_out, p->ai_addr, p->ai_addrlen) == 0) {
-        break; // Successfully connected
-      }
+      if (connect(fd_out, p->ai_addr, p->ai_addrlen) == 0)
+        break;
       close(fd_out);
       fd_out = -1;
     }
@@ -278,106 +419,68 @@ int main(int argc, char *argv[]) {
               port);
       exit(EXIT_FAILURE);
     }
-
     freeaddrinfo(res);
 
-    // Print sending banner
     if (verbose) {
-      fprintf(stderr, PROG_NAME ": connected to %s:%s\n", host, port);
-      if (read_limit > 0) {
-        fprintf(stderr, PROG_NAME ": sending from %s %llu bytes to %s:%s\n",
-                display_in, read_limit, host, port);
-      } else {
-        fprintf(stderr, PROG_NAME ": sending from %s to %s:%s\n", display_in,
-                host, port);
-      }
+      fprintf(stderr, PROG_NAME ": connected to TCP %s:%s\n", host, port);
+      fprintf(stderr, PROG_NAME ": sending from %s to %s:%s\n", display_in,
+              host, port);
     }
     free(host);
   }
 
-  // Main Copy Loop
-  unsigned long long total_read = 0;
-  unsigned long long total_written = 0;
-  char buffer[BUFFER_SIZE];
-
-  while (1) {
-    size_t bytes_to_read = BUFFER_SIZE;
-
-    // Apply read limit
-    if (read_limit > 0 && (read_limit - total_read) < bytes_to_read) {
-      bytes_to_read = read_limit - total_read;
-    }
-    if (read_limit > 0 && bytes_to_read == 0) {
-      break; // Read limit reached
-    }
-
-    // Short-circuit if write limit is already reached
-    if (write_limit > 0 && total_written >= write_limit) {
-      break;
-    }
-
-    ssize_t n_read = read(fd_in, buffer, bytes_to_read);
-    if (n_read < 0) {
-      if (errno == EINTR)
-        continue;
-      perror(PROG_NAME ": read error");
-      break;
-    }
-    if (n_read == 0) {
-      break; // EOF
-    }
-
-    total_read += n_read;
-
-    // Write what was read
-    char *ptr = buffer;
-    ssize_t remaining = n_read;
-
-    // Truncate write block if write limit will be exceeded
-    if (write_limit > 0 && (total_written + remaining) > write_limit) {
-      remaining = write_limit - total_written;
-    }
-
-    while (remaining > 0) {
-      ssize_t n_written = write(fd_out, ptr, remaining);
-      if (n_written < 0) {
-        if (errno == EINTR)
-          continue;
-        if (errno != EPIPE) {
-          // EPIPE is expected if remote closes connection early
-          perror(PROG_NAME ": write error");
-        }
-        goto loop_end;
-      }
-      if (n_written == 0)
-        goto loop_end; // Should not happen in blocking mode
-
-      total_written += n_written;
-      ptr += n_written;
-      remaining -= n_written;
-    }
-
-    if (write_limit > 0 && total_written >= write_limit) {
-      break;
-    }
+  // Initialize Threaded Ring Buffer
+  size_t ring_capacity = 1048576; // 1 MB Default
+  char *env_cap = getenv("CAT_BUFFER_SIZE");
+  if (env_cap) {
+    int parsed_cap = atoi(env_cap);
+    if (parsed_cap > 0)
+      ring_capacity = (size_t)parsed_cap;
   }
-loop_end:
 
-  // Final output messages
+  RingBuffer rb;
+  memset(&rb, 0, sizeof(RingBuffer));
+  rb.capacity = ring_capacity;
+  rb.data = malloc(rb.capacity);
+  if (!rb.data) {
+    fprintf(stderr,
+            PROG_NAME ": error: failed to allocate %zu bytes for ring buffer\n",
+            rb.capacity);
+    exit(EXIT_FAILURE);
+  }
+
+  rb.fd_in = fd_in;
+  rb.fd_out = fd_out;
+  rb.read_limit = read_limit;
+  rb.write_limit = write_limit;
+
+  pthread_mutex_init(&rb.lock, NULL);
+  pthread_cond_init(&rb.not_empty, NULL);
+  pthread_cond_init(&rb.not_full, NULL);
+
+  pthread_t prod_tid, cons_tid;
+
+  // Launching the producer and consumer engines
+  pthread_create(&prod_tid, NULL, producer_thread, &rb);
+  pthread_create(&cons_tid, NULL, consumer_thread, &rb);
+
+  // Wait for completion
+  pthread_join(prod_tid, NULL);
+  pthread_join(cons_tid, NULL);
+
+  // Final Output Messages
   if (verbose) {
     if (listen_port) {
       fprintf(stderr,
               PROG_NAME
-              ": received from port %s and written %llu bytes to %s\n",
-              listen_port, total_written, display_out);
+              ": received from TCP port %s and written %llu bytes to %s\n",
+              listen_port, rb.total_written, display_out);
     } else if (connect_hostport) {
-      if (read_limit > 0 && total_written < read_limit) {
+      if (read_limit > 0 && rb.total_written < read_limit) {
         fprintf(stderr, PROG_NAME ": %llu received of %llu sent to %s\n",
-                total_written, read_limit, connect_hostport);
-      } else if (read_limit > 0) {
-        fprintf(stderr, PROG_NAME ": %llu bytes sent\n", total_written);
+                rb.total_written, read_limit, connect_hostport);
       } else {
-        fprintf(stderr, PROG_NAME ": %llu bytes sent to %s\n", total_written,
+        fprintf(stderr, PROG_NAME ": %llu bytes sent to %s\n", rb.total_written,
                 connect_hostport);
       }
     }
@@ -388,6 +491,11 @@ loop_end:
     close(fd_in);
   if (fd_out != STDOUT_FILENO && fd_out >= 0)
     close(fd_out);
+
+  pthread_mutex_destroy(&rb.lock);
+  pthread_cond_destroy(&rb.not_empty);
+  pthread_cond_destroy(&rb.not_full);
+  free(rb.data);
 
   return 0;
 }

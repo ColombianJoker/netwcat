@@ -108,8 +108,9 @@ int main(int argc, char *argv[]) {
   }
   if (!listen_port && !connect_hostport) {
     fprintf(stderr, PROG_NAME ": error: must specify either -l or -c\n");
-    fprintf(stderr, "©️ 2026, Ramón Barrios Láscar.\n");
-    exit(EXIT_FAILURE);
+    // fprintf(stderr, "©️ 2026, Ramón Barrios Láscar.\n");
+    print_usage_and_exit(EXIT_FAILURE);
+    // exit(EXIT_FAILURE);
   }
   if (listen_port && infile) {
     fprintf(stderr, PROG_NAME
